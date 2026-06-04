@@ -17,7 +17,8 @@ class Trainer:
         model = Genesis(
             vocab_size=self.cfg["vocab_size"], dim=self.cfg["dim"],
             layers=self.cfg["layers"],         heads=self.cfg["heads"],
-            block_size=self.cfg["block_size"],
+            block_size=self.cfg["block_size"], dropout=self.cfg["dropout"],
+            grad_checkpoint=self.cfg["grad_checkpoint"],
         ).to(device)
         return model
 

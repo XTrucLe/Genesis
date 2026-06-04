@@ -5,7 +5,7 @@ CFG = dict(
     layers          = 24,                                               batch_size      = 1,
     heads           = 14,                                               grad_accum      = 32,
     dim             = 1792,                                             num_workers     = 2,
-    dropout         = 0.1,                                              prefetch_factor = 2,
+    dropout         = 0.0,                                              prefetch_factor = 2,
     bias            = False,                                            chunk_size      = 64,
     grad_checkpoint = False,                                            shuffle_buffer  = 512,
     compile         = False,                                            dtype           = "float16",
