@@ -1,0 +1,6 @@
+[project]
+name = "genesis"
+version = "0.1.0"
+
+[project.scripts]
+genesis-train = "genesis.train:main"

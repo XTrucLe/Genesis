@@ -1,0 +1,9 @@
+torch
+numpy
+fsspec
+sentencepiece
+bitsandbytes
+safetensors 
+datasets
+transformers
+huggingface_hub
