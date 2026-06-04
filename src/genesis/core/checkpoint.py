@@ -3,7 +3,11 @@ import json
 import torch
 import sys
 from safetensors.torch import save_file
+from huggingface_hub.utils import logging, disable_progress_bars
 from genesis.utils.common import get_raw_model, _to_cpu
+
+logging.set_verbosity_error()
+disable_progress_bars()
 
 class CheckpointModule:
     def __init__(self, cfg: dict):
@@ -63,15 +67,6 @@ class CheckpointModule:
         }, training_state_path)
 
         print(f"\n📡 [HF Backup] Spawning background worker to upload step {step}...")
-        
-        cmd = [
-            sys.executable, "-m", "huggingface_hub.cli.huggingface_cli", "upload",
-            self.repo_id,
-            self.local_temp_dir,
-            ".",
-            "--token", self.token,
-            "--commit-message", f"Automated background backup | Step {step} | Loss {loss:.4f}"
-        ]
         
         try:
             self.api.upload_folder(
