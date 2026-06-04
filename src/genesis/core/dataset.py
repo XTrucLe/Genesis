@@ -141,7 +141,7 @@ class BinDataset(IterableDataset):
         global_samples_to_skip = self.samples_offset
 
         while True:
-            for shard_idx, shard in worker_shards:
+            for shard_idx, shard in enumerate(worker_shards):
                 if global_samples_to_skip >= shard["num_samples"]:
                     global_samples_to_skip -= shard["num_samples"]
                     continue
