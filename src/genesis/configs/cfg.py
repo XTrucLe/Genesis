@@ -3,7 +3,7 @@ CFG = dict(
     vocab_size      = 36864,                                            spm_prefix      = "genesis",
     block_size      = 2048,                                             data_split      = "train",
     layers          = 24,                                               batch_size      = 1,
-    heads           = 16,                                               grad_accum      = 32,
+    heads           = 14,                                               grad_accum      = 32,
     dim             = 1792,                                             num_workers     = 2,
     dropout         = 0.1,                                              prefetch_factor = 2,
     bias            = False,                                            chunk_size      = 64,
