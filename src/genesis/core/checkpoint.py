@@ -21,7 +21,7 @@ class CheckpointModule:
         except Exception as e:
             print(f"[hf_ckpt] Warning when creating repo: {e}")
 
-    def save(self, model, optimizer, scaler, step, loss):
+    def save(self, model, optimizer, scaler, step, loss, ddp_world_size=1):
         raw_model = get_raw_model(model)
         
         raw_state = raw_model.state_dict()
@@ -39,7 +39,7 @@ class CheckpointModule:
             "num_hidden_layers": self.cfg["layers"],
             "num_attention_heads": self.cfg["heads"],
             "max_position_embeddings": self.cfg["block_size"],
-            "torch_dtype": "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
+            "torch_dtype": self.cfg["dtype"],
         }
         config_path = os.path.join(self.local_temp_dir, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
@@ -48,9 +48,15 @@ class CheckpointModule:
         safetensors_path = os.path.join(self.local_temp_dir, "model.safetensors")
         save_file(cpu_clean_state, safetensors_path, metadata={"step": str(step), "loss": f"{loss:.4f}"})
 
+        current_global_batch_size = self.cfg["batch_size"] * self.cfg["grad_accum"] * ddp_world_size
+        samples_trained = step * current_global_batch_size
+
         training_state_path = os.path.join(self.local_temp_dir, "training_state.pt")
         torch.save({
             "step":      step,
+            "batch_size": self.cfg["batch_size"],
+            "grad_accum": self.cfg["grad_accum"],
+            "samples_trained": samples_trained,
             "loss":      float(loss),
             "optimizer": _to_cpu(optimizer.state_dict()),
             "scaler":    _to_cpu(scaler.state_dict()),
@@ -79,7 +85,7 @@ class CheckpointModule:
         except Exception as e:
             print(f"❌ [HF Backup] Failed to trigger upload: {e}")
 
-    def load(self, model, optimizer, scaler) -> int:
+    def load(self, model, optimizer, scaler, dataset=None, ddp_world_size=1) -> int:
         from huggingface_hub import hf_hub_download
         print(f"[hf_ckpt] Checking for the latest checkpoint on Hugging Face Hub ({self.repo_id})...")
         
@@ -99,6 +105,13 @@ class CheckpointModule:
         ckpt = torch.load(training_state_path, map_location="cpu", weights_only=True)
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
+
+        samples_trained = ckpt.get("samples_trained", ckpt["step"] * self.cfg["batch_size"] * self.cfg["grad_accum"] * ddp_world_size)
+
+        if dataset and hasattr(dataset, "set_resume_state"):
+            dataset.set_resume_state(samples_trained)
         
-        print(f"[hf_ckpt] Successfully loaded checkpoint from Hugging Face Hub at step {ckpt['step']}")
-        return ckpt["step"] + 1
+        rescaled_step = samples_trained // (self.cfg["batch_size"] * self.cfg["grad_accum"] * ddp_world_size)
+
+        print(f"[hf_ckpt] Successfully loaded checkpoint from Hugging Face Hub at step {rescaled_step}")
+        return rescaled_step

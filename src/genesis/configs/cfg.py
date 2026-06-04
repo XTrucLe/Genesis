@@ -6,9 +6,9 @@ CFG = dict(
     heads           = 16,                                               grad_accum      = 32,
     dim             = 1792,                                             num_workers     = 2,
     dropout         = 0.1,                                              prefetch_factor = 2,
-    bias            = False,                                            
-    grad_checkpoint = False,                                            
-    compile         = False,
+    bias            = False,                                            chunk_size      = 64,
+    grad_checkpoint = False,                                            shuffle_buffer  = 512,
+    compile         = False,                                            dtype           = "float16",
 
     # --- CHECKPOINT & LOG ---                                          # --- OPTIMIZER & SCHEDULER ---
     checkpoint_dir  = "genesis/checkpoints",                            total_steps     = 100_000,

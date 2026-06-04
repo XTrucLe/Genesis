@@ -5,7 +5,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import bitsandbytes as bnb
 from genesis.core.model import Genesis
-from genesis.utils.common import IS_AMPERE, HAS_BF16, get_lr, task_queue
+from genesis.utils.common import IS_AMPERE, get_lr, task_queue
 
 class Trainer:
     def __init__(self, cfg: dict, data_manager, checkpoint_manager):
@@ -64,17 +64,24 @@ class Trainer:
         if master_process:
             print(f"GPU   : {torch.cuda.get_device_name(device) if is_cuda else 'CPU'}")
             print(f"Params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
-            print(f"dtype : {'bfloat16' if HAS_BF16 else 'float16'}")
+            print(f"dtype : {self.cfg['dtype']}")
             print(f"DDP   : {'Active' if ddp else 'Disabled'} (Number of GPUs: {ddp_world_size})")
 
-        use_scaler = is_cuda and not HAS_BF16
+        use_scaler = is_cuda and self.cfg["dtype"] in ("float16", "bfloat16")
         scaler     = torch.amp.GradScaler(enabled=use_scaler)
-        amp_dtype  = torch.bfloat16 if HAS_BF16 else torch.float16
+        amp_dtype  = torch.float16 if self.cfg["dtype"] == "float16" else torch.bfloat16
         amp_ctx    = torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=is_cuda)
 
         ckpt_mgr = self.checkpoint_manager
-        step     = ckpt_mgr.load(model, optimizer, scaler) if self.cfg["resume"] else 0
-        
+        loader = self.data_manager.build_loader()
+        step = ckpt_mgr.load(
+                model=model, 
+                optimizer=optimizer, 
+                scaler=scaler, 
+                dataset=loader.dataset,
+                ddp_world_size=ddp_world_size
+            ) if self.cfg["resume"] else 0    
+
         if ddp:
             model = DDP(model, device_ids=[ddp_local_rank])
 
@@ -84,7 +91,7 @@ class Trainer:
             print("Compiling...")
             model = torch.compile(model, mode="reduce-overhead")
 
-        data_iter = iter(self.data_manager.build_loader())
+        data_iter = iter(loader)
         model.train()
 
         t0=t1 =None
@@ -153,12 +160,12 @@ class Trainer:
 
 
             if do_save and master_process:
-                self.checkpoint_manager.save(raw_model, optimizer, scaler, step, accum_loss)
+                self.checkpoint_manager.save(raw_model, optimizer, scaler, step, accum_loss, ddp_world_size)
             
             step += 1
             
         if master_process:
-            self.checkpoint_manager.save(raw_model, optimizer, scaler, step, 0.0)
+            self.checkpoint_manager.save(raw_model, optimizer, scaler, step, 0.0, ddp_world_size)
             task_queue.join()
             print("Training complete")
 
