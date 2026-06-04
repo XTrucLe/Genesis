@@ -155,9 +155,6 @@ class BinDataset(IterableDataset):
                     actual_size -= byte_offset
                     global_samples_to_skip = 0
 
-                if shard_idx % total_workers != global_worker_id:
-                    continue
-
                 url = f"hf://datasets/{self.repo_id}/{shard['file_path']}"
                 remainder = b""
 

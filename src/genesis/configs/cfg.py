@@ -13,7 +13,7 @@ CFG = dict(
     # --- CHECKPOINT & LOG ---                                          # --- OPTIMIZER & SCHEDULER ---
     checkpoint_dir  = "genesis/checkpoints",                            total_steps     = 100_000,
     resume          = False,                                            warmup_steps    = 1000,
-    save_every      = 5,                                                lr              = 3e-4,
+    save_every      = 50,                                               lr              = 3e-4,
     log_every       = 10,                                               min_lr          = 1e-5,
     seed            = 55,                                               betas           = (0.9, 0.95),
                                                                         weight_decay    = 0.1,
