@@ -10,11 +10,11 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         assert dim % 2 == 0
         inv_freq = 1.0 / (25000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("inv_freq", inv_freq, persistent=True)
         freqs = torch.outer(torch.arange(block_size).float(), inv_freq)
         emb   = torch.cat([freqs, freqs], dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=True)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=True)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -29,23 +29,35 @@ class RotaryEmbedding(nn.Module):
                 k * cos + self._rotate_half(k) * sin)
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, block_size: int, dropout: float = 0.1):
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, dim: int, heads: int, kv_heads: int, block_size: int, dropout: float = 0.1):
         super().__init__()
         assert dim % heads == 0
-        self.heads    = heads
-        self.head_dim = dim // heads
-        self.qkv      = nn.Linear(dim, 3 * dim, bias=False)
-        self.proj     = nn.Linear(dim, dim, bias=False)
-        self.drop     = nn.Dropout(dropout)
-        self.rope     = RotaryEmbedding(self.head_dim, block_size)
+        assert heads % kv_heads == 0
+        self.heads              = heads
+        self.kv_heads           = kv_heads
+        self.num_queries_per_kv = heads // kv_heads
+        self.head_dim           = dim // heads
+
+        self.q_proj             = nn.Linear(dim, dim, bias=False)
+        self.kv_proj             = nn.Linear(dim, 2 * kv_heads * self.head_dim, bias=False)
+        self.proj               = nn.Linear(dim, dim, bias=False)
+        self.drop               = nn.Dropout(dropout)
+        self.rope               = RotaryEmbedding(self.head_dim, block_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, self.heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
+        q = self.q_proj(x).reshape(B, T, self.heads, self.head_dim)
+        kv = self.kv_proj(x).reshape(B, T, 2, self.kv_heads, self.head_dim)
+        k, v = kv.unbind(dim=2)
+
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        q, k    = self.rope(q, k)
+        q, k = self.rope(q, k)
+
+        if self.num_queries_per_kv > 1:
+            k = k.unsqueeze(2).expand(-1, -1, self.num_queries_per_kv, -1, -1).reshape(B, self.heads, T, self.head_dim)
+            v = v.unsqueeze(2).expand(-1, -1, self.num_queries_per_kv, -1, -1).reshape(B, self.heads, T, self.head_dim)
+            
         out = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p = self.drop.p if self.training else 0.0,
@@ -68,10 +80,10 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, heads: int, block_size: int, dropout: float = 0.1):
+    def __init__(self, dim: int, heads: int, kv_heads: int, block_size: int, dropout: float = 0.1):
         super().__init__()
         self.ln1  = nn.RMSNorm(dim)
-        self.attn = CausalSelfAttention(dim, heads, block_size, dropout)
+        self.attn = GroupedQueryAttention(dim, heads, kv_heads=kv_heads, block_size=block_size, dropout=dropout)
         self.ln2  = nn.RMSNorm(dim)
         self.ff   = FeedForward(dim, dropout)
 
@@ -85,10 +97,11 @@ class Genesis(nn.Module):
     def __init__(
         self,
         vocab_size:  int,
-        dim:         int   = 1792,
-        layers:      int   = 24,
-        heads:       int   = 16,
-        block_size: int    = 2048,
+        dim:         int   = 1536,
+        layers:      int   = 32,
+        heads:       int   = 12,
+        kv_heads:    int   = 3,
+        block_size: int   = 2048,
         dropout:     float = 0.1,
         grad_checkpoint: bool = True,
     ):
@@ -98,7 +111,7 @@ class Genesis(nn.Module):
         self.embedding = nn.Embedding(vocab_size, dim)
         self.drop      = nn.Dropout(dropout)
         self.blocks    = nn.ModuleList([
-            Block(dim, heads, block_size, dropout) for _ in range(layers)
+            Block(dim, heads, kv_heads, block_size, dropout) for _ in range(layers)
         ])
         self.ln_f    = nn.RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
