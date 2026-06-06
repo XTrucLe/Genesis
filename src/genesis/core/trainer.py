@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import bitsandbytes as bnb
-from genesis.core.model import Genesis
+from genesis.core.model.Genesis import Genesis
 from genesis.utils.common import IS_AMPERE, get_lr, task_queue
 
 class Trainer:
@@ -129,8 +129,7 @@ class Trainer:
 
                 
                 with amp_ctx:
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.flatten(0, 1), y.flatten(0, 1), ignore_index=-1)
+                    loss = model(x, y)
                     scaled_loss = loss / self.cfg["grad_accum"]
                 
                 scaler.scale(scaled_loss).backward()

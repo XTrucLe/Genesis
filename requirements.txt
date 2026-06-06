@@ -3,7 +3,8 @@ numpy
 fsspec
 sentencepiece
 bitsandbytes
-safetensors 
+safetensors
+liger-kernel
 datasets
 transformers
 huggingface_hub

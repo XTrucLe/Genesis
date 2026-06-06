@@ -36,7 +36,7 @@ def test_pipeline():
 
     print("\n=== BƯỚC 3: CHẠY THỬ MÔ HÌNH JARVIS (CPU) ===")
     try:
-        from genesis.core.model import Genesis
+        from genesis.core.model.Genesis import Genesis
         
         cfg["compile"] = False 
         

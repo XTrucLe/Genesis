@@ -36,7 +36,7 @@ def test_pipeline():
         return
     print("\n=== BƯỚC 3: CHẠY THỬ MÔ HÌNH JARVIS (CPU) ===")
     try:
-        from genesis.core.model import Genesis
+        from genesis.core.model.Genesis import Genesis
         cfg["compile"] = False
         print("Đang khởi tạo mô hình Genesis trên CPU...")
         model = Genesis(
