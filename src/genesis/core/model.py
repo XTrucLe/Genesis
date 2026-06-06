@@ -13,8 +13,8 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=True)
         freqs = torch.outer(torch.arange(block_size).float(), inv_freq)
         emb   = torch.cat([freqs, freqs], dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=True)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=True)
+        self.register_buffer("cos_cached", emb.cos(), persistent=True)
+        self.register_buffer("sin_cached", emb.sin(), persistent=True)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -22,13 +22,9 @@ class RotaryEmbedding(nn.Module):
         return torch.cat([-x2, x1], dim=-1)
 
     def forward(self, q, k):
-        T = q.size(2)
-
-        t = torch.arange(T, device=q.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-
-        cos = freqs.cos()[None, None, :, :]
-        sin = freqs.sin()[None, None, :, :]
+        T = q.size(1)
+        cos = self.cos_cached[:T, None, :]
+        sin = self.sin_cached[:T, None, :]
 
         return (
             q * cos + self._rotate_half(q) * sin,
@@ -54,20 +50,22 @@ class GroupedQueryAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        q = self.q_proj(x).view(B, T, self.heads, self.head_dim).transpose(1, 2)
-
+        q = self.q_proj(x).view(B, T, self.heads, self.head_dim)
         kv = self.kv_proj(x).view(B, T, 2, self.kv_heads, self.head_dim)
         k, v = kv.unbind(dim=2)
+        q, k = self.rope(q, k)
+        q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        q, k = self.rope(q, k)
+        if self.num_queries_per_kv > 1:
+            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
             
         out = F.scaled_dot_product_attention(
             q, k, v,
             is_causal = True,
             dropout_p = self.drop.p if self.training else 0.0,
-            enable_gqa = True,
         )
         return self.proj(out.transpose(1, 2).contiguous().view(B, T, C))
 
