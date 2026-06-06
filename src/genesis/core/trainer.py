@@ -14,13 +14,12 @@ class Trainer:
         self.checkpoint_manager = checkpoint_manager
 
     def _build_model(self, device):
-        model = Genesis(
-            vocab_size=self.cfg["vocab_size"], dim=self.cfg["dim"],
-            layers=self.cfg["layers"],         heads=self.cfg["heads"],
-            block_size=self.cfg["block_size"], dropout=self.cfg["dropout"],
-            grad_checkpoint=self.cfg["grad_checkpoint"],
-        ).to(device)
-        return model
+        return Genesis(
+            vocab_size=self.cfg["vocab_size"],  block_size=self.cfg["block_size"],
+            layers=self.cfg["layers"],          heads=self.cfg["heads"],
+            dim=self.cfg["dim"],                kv_heads=self.cfg["kv_heads"],       
+            dropout=self.cfg["dropout"],        grad_checkpoint=self.cfg["grad_checkpoint"],
+        ).to(device=device, dtype=getattr(torch, self.cfg["dtype"]))
 
     def _build_optimizer(self, model):
         decay, no_decay = [], []
