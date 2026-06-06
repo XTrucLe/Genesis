@@ -50,17 +50,23 @@ class GroupedQueryAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
+        
         q = self.q_proj(x).view(B, T, self.heads, self.head_dim)
         kv = self.kv_proj(x).view(B, T, 2, self.kv_heads, self.head_dim)
         k, v = kv.unbind(dim=2)
+
         q, k = self.rope(q, k)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
         if self.num_queries_per_kv > 1:
-            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
-            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+
+            k = k.unsqueeze(2).expand(B, self.kv_heads, self.num_queries_per_kv, T, self.head_dim)
+            k = k.reshape(B, self.heads, T, self.head_dim)
+            
+            v = v.unsqueeze(2).expand(B, self.kv_heads, self.num_queries_per_kv, T, self.head_dim)
+            v = v.reshape(B, self.heads, T, self.head_dim)
             
         out = F.scaled_dot_product_attention(
             q, k, v,
