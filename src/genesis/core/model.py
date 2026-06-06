@@ -21,12 +21,19 @@ class RotaryEmbedding(nn.Module):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor):
-        T   = q.shape[2]
-        cos = self.cos_cached[:, :, :T, :]
-        sin = self.sin_cached[:, :, :T, :]
-        return (q * cos + self._rotate_half(q) * sin,
-                k * cos + self._rotate_half(k) * sin)
+    def forward(self, q, k):
+        T = q.size(2)
+
+        t = torch.arange(T, device=q.device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
+        cos = freqs.cos()[None, None, :, :]
+        sin = freqs.sin()[None, None, :, :]
+
+        return (
+            q * cos + self._rotate_half(q) * sin,
+            k * cos + self._rotate_half(k) * sin,
+        )
 
 
 class GroupedQueryAttention(nn.Module):
@@ -47,23 +54,22 @@ class GroupedQueryAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        q = self.q_proj(x).reshape(B, T, self.heads, self.head_dim)
-        kv = self.kv_proj(x).reshape(B, T, 2, self.kv_heads, self.head_dim)
+        q = self.q_proj(x).view(B, T, self.heads, self.head_dim).transpose(1, 2)
+
+        kv = self.kv_proj(x).view(B, T, 2, self.kv_heads, self.head_dim)
         k, v = kv.unbind(dim=2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q, k = self.rope(q, k)
-
-        if self.num_queries_per_kv > 1:
-            k = k.unsqueeze(2).expand(-1, -1, self.num_queries_per_kv, -1, -1).reshape(B, self.heads, T, self.head_dim)
-            v = v.unsqueeze(2).expand(-1, -1, self.num_queries_per_kv, -1, -1).reshape(B, self.heads, T, self.head_dim)
             
         out = F.scaled_dot_product_attention(
             q, k, v,
-            dropout_p = self.drop.p if self.training else 0.0,
             is_causal = True,
+            dropout_p = self.drop.p if self.training else 0.0,
+            enable_gqa = True,
         )
-        return self.proj(out.transpose(1, 2).contiguous().reshape(B, T, C))
+        return self.proj(out.transpose(1, 2).contiguous().view(B, T, C))
 
 
 class FeedForward(nn.Module):

@@ -6,9 +6,9 @@ CFG = dict(
     heads           = 12,                                               grad_accum      = 32,
     kv_heads        = 3,                                                dtype           = "float16",
     dim             = 1536,                                             num_workers     = 2,
-    dropout         = 0.1,                                              prefetch_factor = 2,
+    dropout         = 0.1,                                              prefetch_factor = 4,
     bias            = False,                                            chunk_size      = 64,
-    grad_checkpoint = False,                                            shuffle_buffer  = 512,
+    grad_checkpoint = True,                                             shuffle_buffer  = 512,
     compile         = False,                                            
 
     # --- CHECKPOINT & LOG ---                                          # --- OPTIMIZER & SCHEDULER ---

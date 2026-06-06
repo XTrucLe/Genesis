@@ -19,7 +19,7 @@ class Trainer:
             layers=self.cfg["layers"],          heads=self.cfg["heads"],
             dim=self.cfg["dim"],                kv_heads=self.cfg["kv_heads"],       
             dropout=self.cfg["dropout"],        grad_checkpoint=self.cfg["grad_checkpoint"],
-        ).to(device=device, dtype=getattr(torch, self.cfg["dtype"]))
+        ).to(device)
 
     def _build_optimizer(self, model):
         decay, no_decay = [], []
@@ -47,7 +47,7 @@ class Trainer:
             master_process = True
             ddp_world_size = 1
             ddp_local_rank = 0
-            
+
         is_cuda = device.type == "cuda"
 
         if IS_AMPERE:
@@ -67,7 +67,7 @@ class Trainer:
             print(f"dtype : {self.cfg['dtype']}")
             print(f"DDP   : {'Active' if ddp else 'Disabled'} (Number of GPUs: {ddp_world_size})")
 
-        use_scaler = is_cuda and self.cfg["dtype"] in ("float16", "bfloat16")
+        use_scaler = is_cuda and self.cfg["dtype"] == "float16"
         scaler     = torch.amp.GradScaler(enabled=use_scaler)
         amp_dtype  = torch.float16 if self.cfg["dtype"] == "float16" else torch.bfloat16
         amp_ctx    = torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=is_cuda)
