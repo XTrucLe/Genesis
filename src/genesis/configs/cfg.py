@@ -2,7 +2,7 @@ CFG = dict(
     # --- MODEL ARCHITECTURE ---                                        # --- DATA & TRAINING SYSTEM ---
     vocab_size      = 36864,                                            spm_prefix      = "genesis",
     block_size      = 2048,                                             data_split      = "train",
-    layers          = 32,                                               batch_size      = 1,
+    layers          = 32,                                               batch_size      = 4,
     heads           = 12,                                               grad_accum      = 32,
     kv_heads        = 3,                                                dtype           = "float16",
     dim             = 1536,                                             num_workers     = 2,
