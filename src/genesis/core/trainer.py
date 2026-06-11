@@ -21,7 +21,8 @@ class Trainer:
             layers=self.cfg["layers"],
             heads=self.cfg["heads"],
             dim=self.cfg["dim"],
-            kv_heads=self.cfg["kv_heads"],
+            lora_rank=self.cfg["lora_rank"],
+            rope_dim=self.cfg.get("rope_dim", 64),
             dropout=self.cfg["dropout"],
             grad_checkpoint=self.cfg["grad_checkpoint"],
         ).to(device)
@@ -107,7 +108,7 @@ class Trainer:
 
         if self.cfg["compile"] and hasattr(torch, "compile"):
             print("Compiling...")
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model)
 
         data_iter = iter(loader)
         model.train()
@@ -124,6 +125,10 @@ class Trainer:
             * ddp_world_size
         )
 
+        accum_loss_tensor = torch.zeros(1, device=device)
+        if ddp:
+            loss_tensor = torch.zeros(1, device=device)
+
         if master_process:
             print(f"\nStart training | step={step} → {self.cfg['total_steps']}")
             print(f"Effective batch: {tokens_per_step:,} tokens/step\n")
@@ -137,10 +142,10 @@ class Trainer:
             do_save = step > 0 and step % self.cfg["save_every"] == 0
 
             optimizer.zero_grad(set_to_none=True)
-            accum_loss = 0.0
 
             if is_cuda and do_log and master_process:
                 t0.record()
+            accum_loss_tensor.zero_()
 
             for _ in range(self.cfg["grad_accum"]):
                 if ddp:
@@ -151,18 +156,18 @@ class Trainer:
                 y = y.to(device, non_blocking=True)
 
                 with amp_ctx:
-                    loss = model(x, y)
+                    _, loss = model(x, y)
                     scaled_loss = loss / self.cfg["grad_accum"]
 
                 scaler.scale(scaled_loss).backward()
-                accum_loss += loss.detach().item()
+                accum_loss_tensor += scaled_loss.detach()
 
             if ddp:
-                loss_tensor = torch.tensor(accum_loss, device=device)
+                loss_tensor.fill_(accum_loss_tensor)
                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-                accum_loss = loss_tensor.item()
-
-            accum_loss /= self.cfg["grad_accum"]
+                accum_loss_val = loss_tensor.item()
+            else:
+                accum_loss_val = accum_loss_tensor.item()
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
@@ -177,16 +182,16 @@ class Trainer:
                     torch.cuda.synchronize()
                     ms = t0.elapsed_time(t1)
                     msg = (
-                        f"step {step:7d} | loss {accum_loss:.5f} | lr {lr:.2e} "
+                        f"step {step:7d} | loss {accum_loss_val:.5f} | lr {lr:.2e} "
                         f"| {tokens_per_step / ms:.1f}k tok/s | {ms:.0f}ms"
                     )
                 else:
-                    msg = f"step {step:7d} | loss {accum_loss:.5f} | lr {lr:.2e}"
+                    msg = f"step {step:7d} | loss {accum_loss_val:.5f} | lr {lr:.2e}"
                 task_queue.put({"type": "log", "data": msg})
 
             if do_save and master_process:
                 self.checkpoint_manager.save(
-                    raw_model, optimizer, scaler, step, accum_loss, ddp_world_size
+                    raw_model, optimizer, scaler, step, accum_loss_val, ddp_world_size
                 )
 
             step += 1

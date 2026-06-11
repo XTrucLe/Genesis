@@ -1,27 +1,42 @@
 CFG = dict(
-    # --- MODEL ARCHITECTURE ---                                        # --- DATA & TRAINING SYSTEM ---
-    vocab_size      = 36864,                                            spm_prefix      = "genesis",
-    block_size      = 2048,                                             data_split      = "train",
-    layers          = 32,                                               batch_size      = 4,
-    heads           = 12,                                               grad_accum      = 32,
-    kv_heads        = 3,                                                dtype           = "float16",
-    dim             = 1536,                                             num_workers     = 2,
-    dropout         = 0.1,                                              prefetch_factor = 4,
-    bias            = False,                                            chunk_size      = 64,
-    grad_checkpoint = True,                                             shuffle_buffer  = 512,
-    compile         = False,                                            
-
-    # --- CHECKPOINT & LOG ---                                          # --- OPTIMIZER & SCHEDULER ---
-    checkpoint_dir  = "genesis/checkpoints",                            total_steps     = 500_000_000,
-    resume          = False,                                            warmup_steps    = 1000,
-    save_every      = 1000,                                             lr              = 3e-4,
-    log_every       = 25,                                               min_lr          = 1e-5,
-    seed            = 55,                                               betas           = (0.9, 0.95),
-                                                                        weight_decay    = 0.1,
-                                                                        max_grad_norm   = 1.0,
-
-                                                                        # --- HUGGINGFACE HUB ---
-                                                                        hf_dataset_repo = "trucle5503/dataset_pretrain",
-                                                                        hf_repo_id      = "trucle5503/Genesis",
-                                                                        hf_token        = "",
+    # --- MODEL ARCHITECTURE ---
+    vocab_size=36 * 1024,
+    spm_prefix="genesis",
+    block_size=8192,
+    layers=32,
+    heads=16,
+    dim=1536,
+    lora_rank=256,
+    rope_dim=64,
+    dropout=0.1,
+    bias=False,
+    grad_checkpoint=True,
+    compile=False,
+    # --- DATA & TRAINING SYSTEM ---
+    data_split="train",
+    batch_size=1,
+    grad_accum=32,
+    dtype="float16",
+    num_workers=2,
+    prefetch_factor=4,
+    chunk_size=64,
+    shuffle_buffer=512,
+    # --- CHECKPOINT & LOG ---
+    checkpoint_dir="genesis/checkpoints",
+    resume=False,
+    save_every=1000,
+    log_every=25,
+    seed=55,
+    # --- OPTIMIZER & SCHEDULER ---
+    total_steps=500_000_000,
+    warmup_steps=1000,
+    lr=3e-4,
+    min_lr=1e-5,
+    betas=(0.9, 0.95),
+    weight_decay=0.1,
+    max_grad_norm=1.0,
+    # --- HUGGINGFACE HUB ---
+    hf_dataset_repo="trucle5503/dataset_pretrain",
+    hf_repo_id="trucle5503/Genesis",
+    hf_token="",
 )

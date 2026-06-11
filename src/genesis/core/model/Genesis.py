@@ -1,8 +1,10 @@
 import math
 from torch import nn
+import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from genesis.configs.cfg import CFG
 from genesis.core.model.modules import Block
 
 
@@ -11,12 +13,13 @@ class Genesis(nn.Module):
         self,
         vocab_size: int,
         dim: int = 1536,
+        lora_rank: int = 512,
         layers: int = 32,
         heads: int = 12,
-        kv_heads: int = 3,
         block_size: int = 2048,
         dropout: float = 0.1,
         grad_checkpoint: bool = True,
+        rope_dim: int = 64,
     ):
         super().__init__()
         self.use_gc = grad_checkpoint
@@ -25,7 +28,10 @@ class Genesis(nn.Module):
         self.embedding = nn.Embedding(vocab_size, dim)
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
-            [Block(dim, heads, kv_heads, block_size, dropout) for _ in range(layers)]
+            [
+                Block(dim, heads, lora_rank, block_size, dropout, rope_dim)
+                for _ in range(layers)
+            ]
         )
         self.ln_f = nn.RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
@@ -48,36 +54,42 @@ class Genesis(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x, y=None):
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None):
         B, T = x.shape
 
-        h = self.embedding(x)
-        h = self.drop(h)
+        h = self.drop(self.embedding(x))
 
         for block in self.blocks:
-            if self.use_gc and self.training:
-                h = checkpoint(block, h, use_reentrant=False)
-            else:
-                h = block(h)
-
-        h = self.ln_f(h)
-        logits = F.linear(h, self.lm_head.weight)
-        if y is not None:
-            if y.ndim == 1:
-                y = y.view(B, T)
-            else:
-                assert y.shape == (B, T), f"y shape mismatch: {y.shape}"
-
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                y.view(-1),
-                ignore_index=-1,
+            h = (
+                checkpoint(block, h, use_reentrant=False)
+                if self.use_gc and self.training
+                else block(h)
             )
-            return loss
 
-        return logits
+        logits = F.linear(self.ln_f(h), self.lm_head.weight)
+        if y is None:
+            return logits, None
+        assert y.shape == (B, T)
+
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+
+        return logits, loss
 
     def num_params(self) -> str:
         total = sum(p.numel() for p in self.parameters())
         train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        train -= self.embedding.weight.numel()
         return f"{train/1e6:.2f}M trainable / {total/1e6:.2f}M total"
+
+
+if __name__ == "__main__":
+    model = Genesis(
+        vocab_size=CFG["vocab_size"],
+        dim=CFG["dim"],
+        layers=CFG["layers"],
+        heads=CFG["heads"],
+        block_size=CFG["block_size"],
+        dropout=CFG["dropout"],
+        grad_checkpoint=CFG["grad_checkpoint"],
+    )
+    print(model.num_params())
