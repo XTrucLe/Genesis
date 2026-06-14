@@ -1,9 +1,9 @@
 CFG = dict(
     # --- MODEL ARCHITECTURE ---
-    vocab_size=36 * 1024,
+    vocab_size=36864,
     spm_prefix="genesis",
     block_size=8192,
-    layers=32,
+    layers=36,
     heads=16,
     dim=1536,
     lora_rank=256,
@@ -14,9 +14,9 @@ CFG = dict(
     compile=False,
     # --- DATA & TRAINING SYSTEM ---
     data_split="train",
-    batch_size=1,
-    grad_accum=32,
-    dtype="float16",
+    batch_size=2,
+    grad_accum=16,
+    dtype="bfloat16",
     num_workers=2,
     prefetch_factor=4,
     chunk_size=64,
@@ -24,6 +24,8 @@ CFG = dict(
     # --- CHECKPOINT & LOG ---
     checkpoint_dir="genesis/checkpoints",
     resume=False,
+    short_run=False,
+    short_run_steps=50,
     save_every=1000,
     log_every=25,
     seed=55,

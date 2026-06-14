@@ -14,7 +14,7 @@ class Trainer:
         self.data_manager = data_manager
         self.checkpoint_manager = checkpoint_manager
 
-    def _build_model(self, device):
+    def _build_model(self) -> Genesis:
         return Genesis(
             vocab_size=self.cfg["vocab_size"],
             block_size=self.cfg["block_size"],
@@ -25,14 +25,16 @@ class Trainer:
             rope_dim=self.cfg.get("rope_dim", 64),
             dropout=self.cfg["dropout"],
             grad_checkpoint=self.cfg["grad_checkpoint"],
-        ).to(device)
+        )
 
-    def _build_optimizer(self, model):
+    def _build_optimizer(self, model: Genesis) -> bnb.optim.AdamW8bit:
         decay, no_decay = [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            (decay if p.ndim >= 2 and "embedding" not in name else no_decay).append(p)
+
+            is_no_decay = p.ndim < 2 or "bias" in name or "norm" in name
+            (no_decay if is_no_decay else decay).append(p)
         return bnb.optim.AdamW8bit(
             [
                 {"params": decay, "weight_decay": self.cfg["weight_decay"]},
@@ -50,47 +52,36 @@ class Trainer:
             ddp_local_rank = int(os.environ["LOCAL_RANK"])
             ddp_world_size = int(os.environ["WORLD_SIZE"])
             device = torch.device(f"cuda:{ddp_local_rank}")
-            torch.cuda.set_device(device)
             master_process = ddp_rank == 0
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            master_process = True
             ddp_world_size = 1
-            ddp_local_rank = 0
+            master_process = True
 
         is_cuda = device.type == "cuda"
-
-        if IS_AMPERE:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-
-        torch.manual_seed(self.cfg["seed"])
         if is_cuda:
             torch.cuda.manual_seed(self.cfg["seed"])
+            if IS_AMPERE:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
 
-        model = self._build_model(device)
+        torch.manual_seed(self.cfg["seed"])
+
+        model = self._build_model()
+        amp_dtype = torch.float16 if self.cfg["dtype"] == "float16" else torch.bfloat16
+        model.to(device)
+
         optimizer = self._build_optimizer(model)
-
-        if master_process:
-            print(f"GPU   : {torch.cuda.get_device_name(device) if is_cuda else 'CPU'}")
-            print(f"Params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
-            print(f"dtype : {self.cfg['dtype']}")
-            print(
-                f"DDP   : {'Active' if ddp else 'Disabled'} (Number of GPUs: {ddp_world_size})"
-            )
-
         use_scaler = is_cuda and self.cfg["dtype"] == "float16"
         scaler = torch.amp.GradScaler(enabled=use_scaler)
-        amp_dtype = torch.float16 if self.cfg["dtype"] == "float16" else torch.bfloat16
         amp_ctx = torch.amp.autocast(
             device_type=device.type, dtype=amp_dtype, enabled=is_cuda
         )
 
-        ckpt_mgr = self.checkpoint_manager
         loader = self.data_manager.build_loader()
         step = (
-            ckpt_mgr.load(
+            self.checkpoint_manager.load(
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
@@ -100,23 +91,28 @@ class Trainer:
             if self.cfg["resume"]
             else 0
         )
+        start_step = step
+        raw_model = model
+
+        if self.cfg["compile"] and hasattr(torch, "compile"):
+            if master_process:
+                print("Compiling model via Inductor (max-autotune)...")
+            torch._inductor.config.triton.cudagraphs = False
+            torch._inductor.config.coordinate_descent_tuning = True
+            model = torch.compile(model)
 
         if ddp:
             model = DDP(model, device_ids=[ddp_local_rank])
-
-        raw_model = model.module if ddp else model
-
-        if self.cfg["compile"] and hasattr(torch, "compile"):
-            print("Compiling...")
-            model = torch.compile(model)
+            raw_model = model.module
 
         data_iter = iter(loader)
         model.train()
 
-        t0 = t1 = None
+        t0, t1 = None, None
         if is_cuda:
-            t0 = torch.cuda.Event(enable_timing=True)
-            t1 = torch.cuda.Event(enable_timing=True)
+            t0, t1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                enable_timing=True
+            )
 
         tokens_per_step = (
             self.cfg["batch_size"]
@@ -124,12 +120,14 @@ class Trainer:
             * self.cfg["grad_accum"]
             * ddp_world_size
         )
-
         accum_loss_tensor = torch.zeros(1, device=device)
-        if ddp:
-            loss_tensor = torch.zeros(1, device=device)
+        loss_tensor = torch.zeros(1, device=device) if ddp else None
 
         if master_process:
+            print(f"GPU   : {torch.cuda.get_device_name(device) if is_cuda else 'CPU'}")
+            print(f"Params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+            print(f"dtype : {self.cfg['dtype']}")
+            print(f"DDP   : {'Active' if ddp else 'Disabled'} ({ddp_world_size} GPUs)")
             print(f"\nStart training | step={step} → {self.cfg['total_steps']}")
             print(f"Effective batch: {tokens_per_step:,} tokens/step\n")
 
@@ -142,7 +140,6 @@ class Trainer:
             do_save = step > 0 and step % self.cfg["save_every"] == 0
 
             optimizer.zero_grad(set_to_none=True)
-
             if is_cuda and do_log and master_process:
                 t0.record()
             accum_loss_tensor.zero_()
@@ -151,9 +148,13 @@ class Trainer:
                 if ddp:
                     model.require_backward_grad_sync = _ == self.cfg["grad_accum"] - 1
 
-                x, y = next(data_iter)
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
+                try:
+                    x, y = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(loader)
+                    x, y = next(data_iter)
+
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
                 with amp_ctx:
                     _, loss = model(x, y)
@@ -181,10 +182,7 @@ class Trainer:
                     t1.record()
                     torch.cuda.synchronize()
                     ms = t0.elapsed_time(t1)
-                    msg = (
-                        f"step {step:7d} | loss {accum_loss_val:.5f} | lr {lr:.2e} "
-                        f"| {tokens_per_step / ms:.1f}k tok/s | {ms:.0f}ms"
-                    )
+                    msg = f"step {step:7d} | loss {accum_loss_val:.5f} | lr {lr:.2e} | {tokens_per_step / ms:.1f}k tok/s | {ms:.0f}ms"
                 else:
                     msg = f"step {step:7d} | loss {accum_loss_val:.5f} | lr {lr:.2e}"
                 task_queue.put({"type": "log", "data": msg})
@@ -194,14 +192,28 @@ class Trainer:
                     raw_model, optimizer, scaler, step, accum_loss_val, ddp_world_size
                 )
 
+            if (
+                self.cfg["short_run"]
+                and step >= start_step + self.cfg["short_run_steps"]
+            ):
+                if master_process:
+                    print(
+                        f"Short run complete: ran {self.cfg['short_run_steps']} steps starting from step {start_step}."
+                    )
+                break
+
             step += 1
+
+        if ddp:
+            dist.barrier()
 
         if master_process:
             self.checkpoint_manager.save(
-                raw_model, optimizer, scaler, step, 0.0, ddp_world_size
+                raw_model, optimizer, scaler, step, accum_loss_val, ddp_world_size
             )
             task_queue.join()
             print("Training complete")
 
         if ddp:
+            dist.barrier()
             dist.destroy_process_group()

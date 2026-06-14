@@ -9,25 +9,31 @@ from genesis.utils.common import get_raw_model, _to_cpu
 logging.set_verbosity_error()
 disable_progress_bars()
 
+
 class CheckpointModule:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.repo_id = self.cfg["hf_repo_id"]
         self.token = self.cfg.get("hf_token", os.environ.get("HF_TOKEN"))
-        
-        self.local_temp_dir = os.path.join(cfg.get("checkpoint_dir", "checkpoints"), "hf_staging")
+
+        self.local_temp_dir = os.path.join(
+            cfg.get("checkpoint_dir", "checkpoints"), "hf_staging"
+        )
         os.makedirs(self.local_temp_dir, exist_ok=True)
-        
+
         from huggingface_hub import HfApi
+
         self.api = HfApi()
         try:
-            self.api.create_repo(repo_id=self.repo_id, token=self.token, exist_ok=True, private=True)
+            self.api.create_repo(
+                repo_id=self.repo_id, token=self.token, exist_ok=True, private=True
+            )
         except Exception as e:
             print(f"[hf_ckpt] Warning when creating repo: {e}")
 
     def save(self, model, optimizer, scaler, step, loss, ddp_world_size=1):
         raw_model = get_raw_model(model)
-        
+
         raw_state = raw_model.state_dict()
         clean_state = {
             k.removeprefix("_orig_mod.").removeprefix("module."): v
@@ -50,31 +56,40 @@ class CheckpointModule:
             json.dump(config_data, f, indent=2)
 
         safetensors_path = os.path.join(self.local_temp_dir, "model.safetensors")
-        save_file(cpu_clean_state, safetensors_path, metadata={"step": str(step), "loss": f"{loss:.4f}"})
+        save_file(
+            cpu_clean_state,
+            safetensors_path,
+            metadata={"step": str(step), "loss": f"{loss:.4f}"},
+        )
 
-        current_global_batch_size = self.cfg["batch_size"] * self.cfg["grad_accum"] * ddp_world_size
+        current_global_batch_size = (
+            self.cfg["batch_size"] * self.cfg["grad_accum"] * ddp_world_size
+        )
         samples_trained = step * current_global_batch_size
 
         training_state_path = os.path.join(self.local_temp_dir, "training_state.pt")
-        torch.save({
-            "step":      step,
-            "batch_size": self.cfg["batch_size"],
-            "grad_accum": self.cfg["grad_accum"],
-            "samples_trained": samples_trained,
-            "loss":      float(loss),
-            "optimizer": _to_cpu(optimizer.state_dict()),
-            "scaler":    _to_cpu(scaler.state_dict()),
-        }, training_state_path)
+        torch.save(
+            {
+                "step": step,
+                "batch_size": self.cfg["batch_size"],
+                "grad_accum": self.cfg["grad_accum"],
+                "samples_trained": samples_trained,
+                "loss": float(loss),
+                "optimizer": _to_cpu(optimizer.state_dict()),
+                "scaler": _to_cpu(scaler.state_dict()),
+            },
+            training_state_path,
+        )
 
         print(f"\n📡 [HF Backup] Spawning background worker to upload step {step}...")
-        
+
         try:
             self.api.upload_folder(
                 folder_path=self.local_temp_dir,
                 repo_id=self.repo_id,
                 token=self.token,
-                commit_message=f"Automated backup | Step {step} | Loss {loss:.4f}",
-                run_as_future=True 
+                commit_message=f"Automated backup - Step {step}",
+                run_as_future=True,
             )
             print("[HF Backup] Upload task spawned successfully in background.")
         except Exception as e:
@@ -82,31 +97,51 @@ class CheckpointModule:
 
     def load(self, model, optimizer, scaler, dataset=None, ddp_world_size=1) -> int:
         from huggingface_hub import hf_hub_download
-        print(f"[hf_ckpt] Checking for the latest checkpoint on Hugging Face Hub ({self.repo_id})...")
-        
+
+        print(
+            f"[hf_ckpt] Checking for the latest checkpoint on Hugging Face Hub ({self.repo_id})..."
+        )
+
         try:
-            safetensors_path = hf_hub_download(repo_id=self.repo_id, filename="model.safetensors", token=self.token)
-            training_state_path = hf_hub_download(repo_id=self.repo_id, filename="training_state.pt", token=self.token)
+            safetensors_path = hf_hub_download(
+                repo_id=self.repo_id, filename="model.safetensors", token=self.token
+            )
+            training_state_path = hf_hub_download(
+                repo_id=self.repo_id, filename="training_state.pt", token=self.token
+            )
         except Exception as e:
-            print(f"[hf_ckpt] No valid checkpoint found on the Hub. Starting training from scratch (Step 0). Details: {e}")
+            print(
+                f"[hf_ckpt] No valid checkpoint found on the Hub. Starting training from scratch (Step 0). Details: {e}"
+            )
             return 0
 
         from safetensors.torch import load_file
+
         state = load_file(safetensors_path, device="cpu")
-        
+
         raw_model = get_raw_model(model)
         raw_model.load_state_dict(state)
-        
+
         ckpt = torch.load(training_state_path, map_location="cpu", weights_only=True)
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
 
-        samples_trained = ckpt.get("samples_trained", ckpt["step"] * self.cfg["batch_size"] * self.cfg["grad_accum"] * ddp_world_size)
+        samples_trained = ckpt.get(
+            "samples_trained",
+            ckpt["step"]
+            * self.cfg["batch_size"]
+            * self.cfg["grad_accum"]
+            * ddp_world_size,
+        )
 
         if dataset and hasattr(dataset, "set_resume_state"):
             dataset.set_resume_state(samples_trained)
-        
-        rescaled_step = samples_trained // (self.cfg["batch_size"] * self.cfg["grad_accum"] * ddp_world_size)
 
-        print(f"[hf_ckpt] Successfully loaded checkpoint from Hugging Face Hub at step {rescaled_step}")
+        rescaled_step = samples_trained // (
+            self.cfg["batch_size"] * self.cfg["grad_accum"] * ddp_world_size
+        )
+
+        print(
+            f"[hf_ckpt] Successfully loaded checkpoint from Hugging Face Hub at step {rescaled_step}"
+        )
         return rescaled_step

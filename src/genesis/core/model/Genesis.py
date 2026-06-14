@@ -18,7 +18,7 @@ class Genesis(nn.Module):
         heads: int = 12,
         block_size: int = 2048,
         dropout: float = 0.1,
-        grad_checkpoint: bool = True,
+        grad_checkpoint: bool = False,
         rope_dim: int = 64,
     ):
         super().__init__()
@@ -35,9 +35,8 @@ class Genesis(nn.Module):
         )
         self.ln_f = nn.RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-        self.lm_head.weight = self.embedding.weight
-
         self._init_weights_all(layers)
+        self.lm_head.weight = self.embedding.weight
 
     def _init_weights_all(self, layers: int):
         self.apply(self._init_module)
@@ -54,32 +53,50 @@ class Genesis(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor | None = None,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        offset: int = 0,
+    ):
         B, T = x.shape
 
         h = self.drop(self.embedding(x))
+        new_kv_caches = [] if kv_caches is not None or y is None else None
 
-        for block in self.blocks:
-            h = (
-                checkpoint(block, h, use_reentrant=False)
-                if self.use_gc and self.training
-                else block(h)
-            )
+        for i, block in enumerate(self.blocks):
+            if self.training:
+                h = (
+                    checkpoint(lambda x: block(x)[0], h, use_reentrant=False)
+                    if self.use_gc
+                    else block(h)[0]
+                )
+            else:
+                past_cache = kv_caches[i] if kv_caches is not None else None
+                h, new_cache = block(h, offset=offset, kv_cache=past_cache)
+                if new_kv_caches is not None:
+                    new_kv_caches.append(new_cache)
 
-        logits = F.linear(self.ln_f(h), self.lm_head.weight)
+        logits = self.lm_head(self.ln_f(h))
+
         if y is None:
-            return logits, None
+            return logits, new_kv_caches
+
         assert y.shape == (B, T)
-
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-
         return logits, loss
 
     def num_params(self) -> str:
+        fmt = lambda n: f"{n/1e9:.2f}B" if n >= 1e9 else f"{n/1e6:.2f}M"
+
         total = sum(p.numel() for p in self.parameters())
-        train = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        train -= self.embedding.weight.numel()
-        return f"{train/1e6:.2f}M trainable / {total/1e6:.2f}M total"
+        train = (
+            sum(p.numel() for p in self.parameters() if p.requires_grad)
+            - self.embedding.weight.numel()
+        )
+
+        return f"{fmt(train)} trainable / {fmt(total)} total"
 
 
 if __name__ == "__main__":
