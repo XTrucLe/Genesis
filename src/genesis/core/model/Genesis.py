@@ -1,11 +1,12 @@
 import math
 from torch import nn
 import torch
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from genesis.configs.cfg import CFG
 from genesis.core.model.modules import Block
+
+from genesis.core.ops.cross_entropy import liger_cross_entropy
 
 
 class Genesis(nn.Module):
@@ -84,7 +85,7 @@ class Genesis(nn.Module):
             return logits, new_kv_caches
 
         assert y.shape == (B, T)
-        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+        loss = liger_cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
         return logits, loss
 
     def num_params(self) -> str:

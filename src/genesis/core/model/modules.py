@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
+from genesis.core.ops.kernels.liger_swiglu import SiLUMulFunction
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -167,7 +169,9 @@ class FeedForward(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.w3(F.silu(self.w1(x)) * self.w2(x)))
+        swiglu_output = SiLUMulFunction.apply(self.w1(x), self.w2(x))
+
+        return self.drop(self.w3(swiglu_output))
 
 
 class Block(nn.Module):
