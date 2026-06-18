@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
+from genesis.core.ops.kernels.liger_swiglu import SiLUMulFunction
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -28,17 +30,13 @@ class RotaryEmbedding(nn.Module):
         self._build_cache(block_size)
 
     def _build_cache(self, seq_len: int) -> None:
-        t = torch.arange(
-            seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-        )
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
         self._cached_seq_len = seq_len
 
-    def _get_cos_sin(
-        self, seq_len: int, offset: int = 0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_cos_sin(self, seq_len: int, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         required = offset + seq_len
         if required > self._cached_seq_len:
             self._build_cache(required)
@@ -52,9 +50,7 @@ class RotaryEmbedding(nn.Module):
     @staticmethod
     def _rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         x1, x2 = x[..., 0::2], x[..., 1::2]
-        return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(
-            -2
-        )
+        return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 
     def forward(
         self,
@@ -167,7 +163,9 @@ class FeedForward(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.w3(F.silu(self.w1(x)) * self.w2(x)))
+        swiglu_output = SiLUMulFunction.apply(self.w1(x), self.w2(x))
+
+        return self.drop(self.w3(swiglu_output))
 
 
 class Block(nn.Module):
@@ -201,9 +199,7 @@ class Block(nn.Module):
         offset: int = 0,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        attn_out, new_kv_cache = self.attn(
-            self.ln1(x), offset=offset, kv_cache=kv_cache
-        )
+        attn_out, new_kv_cache = self.attn(self.ln1(x), offset=offset, kv_cache=kv_cache)
 
         x = x + attn_out
         x = x + self.ff(self.ln2(x))

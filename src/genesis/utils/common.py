@@ -31,12 +31,8 @@ def get_lr(step, cfg):
     if step < cfg["warmup_steps"]:
         return cfg["lr"] * step / cfg["warmup_steps"]
 
-    progress = (step - cfg["warmup_steps"]) / max(
-        1, cfg["total_steps"] - cfg["warmup_steps"]
-    )
-    return cfg["min_lr"] + 0.5 * (cfg["lr"] - cfg["min_lr"]) * (
-        1 + math.cos(math.pi * progress)
-    )
+    progress = (step - cfg["warmup_steps"]) / max(1, cfg["total_steps"] - cfg["warmup_steps"])
+    return cfg["min_lr"] + 0.5 * (cfg["lr"] - cfg["min_lr"]) * (1 + math.cos(math.pi * progress))
 
 
 def get_raw_model(model):

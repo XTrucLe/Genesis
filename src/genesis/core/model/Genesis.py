@@ -1,11 +1,11 @@
 import math
-from torch import nn
 import torch
-import torch.nn.functional as F
+from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from genesis.configs.cfg import CFG
 from genesis.core.model.modules import Block
+from genesis.core.ops.cross_entropy import liger_cross_entropy
 
 
 class Genesis(nn.Module):
@@ -27,12 +27,7 @@ class Genesis(nn.Module):
         self.dim = dim
         self.embedding = nn.Embedding(vocab_size, dim)
         self.drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList(
-            [
-                Block(dim, heads, lora_rank, block_size, dropout, rope_dim)
-                for _ in range(layers)
-            ]
-        )
+        self.blocks = nn.ModuleList([Block(dim, heads, lora_rank, block_size, dropout, rope_dim) for _ in range(layers)])
         self.ln_f = nn.RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self._init_weights_all(layers)
@@ -67,11 +62,7 @@ class Genesis(nn.Module):
 
         for i, block in enumerate(self.blocks):
             if self.training:
-                h = (
-                    checkpoint(lambda x: block(x)[0], h, use_reentrant=False)
-                    if self.use_gc
-                    else block(h)[0]
-                )
+                h = checkpoint(lambda x: block(x)[0], h, use_reentrant=False) if self.use_gc else block(h)[0]
             else:
                 past_cache = kv_caches[i] if kv_caches is not None else None
                 h, new_cache = block(h, offset=offset, kv_cache=past_cache)
@@ -84,17 +75,14 @@ class Genesis(nn.Module):
             return logits, new_kv_caches
 
         assert y.shape == (B, T)
-        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+        loss = liger_cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
         return logits, loss
 
     def num_params(self) -> str:
-        fmt = lambda n: f"{n/1e9:.2f}B" if n >= 1e9 else f"{n/1e6:.2f}M"
+        fmt = lambda n: f"{n / 1e9:.2f}B" if n >= 1e9 else f"{n / 1e6:.2f}M"
 
         total = sum(p.numel() for p in self.parameters())
-        train = (
-            sum(p.numel() for p in self.parameters() if p.requires_grad)
-            - self.embedding.weight.numel()
-        )
+        train = sum(p.numel() for p in self.parameters() if p.requires_grad) - self.embedding.weight.numel()
 
         return f"{fmt(train)} trainable / {fmt(total)} total"
 

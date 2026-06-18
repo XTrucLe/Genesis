@@ -28,21 +28,15 @@ class BinDataset(IterableDataset):
 
         self.api = HfApi(token=self.token)
         try:
-            all_files = self.api.list_repo_files(
-                repo_id=self.repo_id, repo_type="dataset"
-            )
+            all_files = self.api.list_repo_files(repo_id=self.repo_id, repo_type="dataset")
         except Exception as e:
             raise RuntimeError(f"Can't reach the repo {self.repo_id}. Error: {e}")
 
-        self.bin_files = sorted(
-            [f for f in all_files if f.endswith(".bin") and self.split in f]
-        )
+        self.bin_files = sorted([f for f in all_files if f.endswith(".bin") and self.split in f])
         if not self.bin_files:
             self.bin_files = sorted([f for f in all_files if f.endswith(".bin")])
         if not self.bin_files:
-            raise ValueError(
-                f"Can't find any .bin files in repo {self.repo_id} for split {self.split}"
-            )
+            raise ValueError(f"Can't find any .bin files in repo {self.repo_id} for split {self.split}")
 
         self._stride = self.block_size
         self._sample_len = self.block_size + 1
@@ -60,25 +54,22 @@ class BinDataset(IterableDataset):
 
     def _get_file_size(self, file_path: str) -> int:
         try:
-            file_info = self.api.get_paths_info(
-                repo_id=self.repo_id, repo_type="dataset", paths=[file_path]
-            )
+            file_info = self.api.get_paths_info(repo_id=self.repo_id, repo_type="dataset", paths=[file_path])
             return file_info[0].size
         except Exception as e:
-            raise RuntimeError(
-                f"Can't get the size of file {file_path} from Hugging Face. Error: {e}"
-            )
+            raise RuntimeError(f"Can't get the size of file {file_path} from Hugging Face. Error: {e}")
 
     def _build_metadata_index(self):
         self.shards = []
-        samples_per_shard = max(
-            1, (self.chunk_size // 2 - self._sample_len) // self._stride + 1
-        )
+        samples_per_shard = max(1, (self.chunk_size // 2 - self._sample_len) // self._stride + 1)
 
         print("Building metadata index from Hugging Face...")
-        for file_path in self.bin_files:
-            file_size = self._get_file_size(file_path)
+        from concurrent.futures import ThreadPoolExecutor
 
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            file_sizes = list(executor.map(self._get_file_size, self.bin_files))
+
+        for file_path, file_size in zip(self.bin_files, file_sizes):
             n_tokens = file_size // 2
             n_samples = (n_tokens - self._sample_len) // self._stride + 1
 
@@ -89,9 +80,7 @@ class BinDataset(IterableDataset):
                 shard_samples = min(samples_per_shard, n_samples - i)
                 start_byte = (i * self._stride) * 2
 
-                shard_bytes = (
-                    (shard_samples - 1) * self._stride + self._sample_len
-                ) * 2
+                shard_bytes = ((shard_samples - 1) * self._stride + self._sample_len) * 2
 
                 self.shards.append(
                     {
@@ -158,11 +147,7 @@ class BinDataset(IterableDataset):
         total_workers = ddp_world * num_workers
         global_worker_id = ddp_rank * num_workers + worker_id
 
-        worker_shards = [
-            shard
-            for i, shard in enumerate(self.shards)
-            if i % total_workers == global_worker_id
-        ]
+        worker_shards = [shard for i, shard in enumerate(self.shards) if i % total_workers == global_worker_id]
         rng = np.random.default_rng(seed=torch.initial_seed() + global_worker_id)
 
         buf: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -187,9 +172,7 @@ class BinDataset(IterableDataset):
                 url = f"hf://datasets/{self.repo_id}/{shard['file_path']}"
                 remainder = b""
 
-                for chunk in self._read_shard(
-                    url, self.token, actual_start_byte, actual_size
-                ):
+                for chunk in self._read_shard(url, self.token, actual_start_byte, actual_size):
                     data = remainder + chunk
                     mv = memoryview(data)
                     batch_t, remainder = self._parse_buffer(mv)
@@ -233,7 +216,5 @@ class DataModule:
             pin_memory=True,
             drop_last=True,
             persistent_workers=self.cfg["num_workers"] > 0,
-            prefetch_factor=(
-                self.cfg["prefetch_factor"] if self.cfg["num_workers"] > 0 else None
-            ),
+            prefetch_factor=(self.cfg["prefetch_factor"] if self.cfg["num_workers"] > 0 else None),
         )
