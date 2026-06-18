@@ -105,48 +105,62 @@ class MultiHeadLatentAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B, T, C = x.shape
         H, Dk, Dv, Dr = self.heads, self.k_head_dim, self.v_head_dim, self.rope_dim
+        Dqk = Dk + Dr
 
-        q_full = self.q_proj(x).view(B, T, H, Dk + Dr)
-        q_nope_raw, q_rope_raw = q_full.split([Dk, Dr], dim=-1)
-        q_nope = q_nope_raw.permute(0, 2, 1, 3)
+        q_full = self.q_proj(x).view(B, T, H, Dqk)
 
         kv = self.kv_up_proj(self.kv_norm(self.kv_down_proj(x))).view(B, T, H, Dk + Dv)
-        k_nope_raw, v_raw = kv.split([Dk, Dv], dim=-1)
-        k_nope = k_nope_raw.permute(0, 2, 1, 3)
-        v_buf = v_raw.permute(0, 2, 1, 3)
-
+        k_nope, v_raw = kv[..., :Dk], kv[..., Dk:]
         k_rope_shared = self.k_rope_proj(x).view(B, T, 1, Dr)
 
-        q_rope_out, k_rope_out = self.rope(
-            q_rope_raw,
+        q_buf = torch.empty_like(q_full)
+        q_buf[..., :Dk] = q_full[..., :Dk]
+
+        k_buf = torch.empty(B, T, 1, Dqk, device=x.device, dtype=x.dtype)
+        k_buf[..., :Dk] = k_nope[:, :, :1, :]
+
+        k_buf = torch.empty(B, T, H, Dqk, dtype=x.dtype, device=x.device)
+        k_buf[..., :Dk] = k_nope
+
+        q_rope_rot, k_rope_rot = self.rope(
+            q_full[..., Dk:],
             k_rope_shared,
             offset,
         )
 
-        q_rope_out = q_rope_out.permute(0, 2, 1, 3)
-        k_rope_out = k_rope_out.permute(0, 2, 1, 3).expand(B, H, T, Dr)
+        q_buf[..., Dk:] = q_rope_rot
+        k_buf[..., Dk:] = k_rope_rot
 
-        q_buf = torch.cat([q_nope, q_rope_out], dim=-1)
-        k_buf = torch.cat([k_nope, k_rope_out], dim=-1)
+        q_sdpa = q_buf.permute(0, 2, 1, 3)
+        k_sdpa = k_buf.permute(0, 2, 1, 3)
+        v_sdpa = v_raw.permute(0, 2, 1, 3)
 
-        if kv_cache is not None:
+        if kv_cache is not None and self.training is False:
             k_prev, v_prev = kv_cache
-            k_buf = torch.cat([k_prev, k_buf], dim=2)
-            v_buf = torch.cat([v_prev, v_buf], dim=2)
-        new_kv_cache = (k_buf, v_buf)
+            k_sdpa = torch.cat([k_prev, k_sdpa], dim=2)
+            v_sdpa = torch.cat([v_prev, v_sdpa], dim=2)
+        new_kv_cache = (k_sdpa, v_sdpa)
 
         is_causal = T > 1
+        is_fp16 = x.dtype == torch.float16
         dp = self.dropout_p if self.training else 0.0
+
+        if is_fp16:
+            q_sdpa, k_sdpa, v_sdpa = q_sdpa.float(), k_sdpa.float(), v_sdpa.float()
+
         out = F.scaled_dot_product_attention(
-            q_buf,
-            k_buf,
-            v_buf,
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
             attn_mask=None,
             is_causal=is_causal,
             dropout_p=dp,
             scale=self.softmax_scale,
         )
 
+        del q_sdpa, k_sdpa, v_sdpa
+
+        out = out.to(x.dtype) if is_fp16 else out
         out = out.permute(0, 2, 1, 3).reshape(B, T, C)
         return self.out_proj(out), new_kv_cache
 

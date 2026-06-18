@@ -117,7 +117,7 @@ class Trainer:
         loss_tensor = torch.zeros(1, device=device) if ddp else None
 
         if master_process:
-            print("─" * 54)
+            print("─" * 56)
             print("🚀 MODEL CONFIG :")
             print(f"   • Architecture: Dim = {self.cfg['dim']} | Layers = {self.cfg['layers']} | Heads = {self.cfg['heads']}")
             print(f"   • Context Len : {self.cfg['block_size']} tokens")
@@ -130,7 +130,7 @@ class Trainer:
             print(f"   • DDP Mode    : {'Active' if ddp else 'Disabled'} ({ddp_world_size} GPU{'' if ddp_world_size == 1 else 's'})")
             steps_info = f"{step:,} → {start_step + self.cfg['short_run_steps']:,} [SHORT RUN]" if self.cfg["short_run"] else f"{step:,} → {self.cfg['total_steps']:,}"
             print(f"   • Total Steps : {steps_info}")
-            print("─" * 54 + "\n")
+            print("─" * 56 + "\n")
 
         while step < self.cfg["total_steps"]:
             lr = get_lr(step, self.cfg)

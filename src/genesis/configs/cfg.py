@@ -2,11 +2,11 @@ CFG = dict(
     # --- MODEL ARCHITECTURE ---
     vocab_size=36864,
     spm_prefix="genesis",
-    block_size=8192,
+    block_size=4096,
     layers=36,
     heads=16,
     dim=1536,
-    lora_rank=256,
+    lora_rank=512,
     rope_dim=64,
     dropout=0.0,
     bias=False,
