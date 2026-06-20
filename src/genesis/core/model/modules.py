@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-from genesis.core.ops.kernels.liger_swiglu import SiLUMulFunction
-
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -13,9 +11,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_f32 = x.float()
-        rrms = torch.rsqrt((x_f32 * x_f32).mean(-1, keepdim=True) + self.eps)
-        return (x_f32 * rrms * self.weight.float()).to(x.dtype)
+        return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
 
 
 class RotaryEmbedding(nn.Module):
@@ -31,26 +27,34 @@ class RotaryEmbedding(nn.Module):
 
     def _build_cache(self, seq_len: int) -> None:
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+
         freqs = torch.outer(t, self.inv_freq)
-        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
-        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
         self._cached_seq_len = seq_len
 
     def _get_cos_sin(self, seq_len: int, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         required = offset + seq_len
         if required > self._cached_seq_len:
-            self._build_cache(required)
+            self._build_cache(max(required, self._cached_seq_len * 2))
         cos = self.cos_cached[offset : offset + seq_len]
         sin = self.sin_cached[offset : offset + seq_len]
         return (
-            cos.view(1, seq_len, 1, self.dim // 2),
-            sin.view(1, seq_len, 1, self.dim // 2),
+            cos.view(1, seq_len, 1, self.dim),
+            sin.view(1, seq_len, 1, self.dim),
         )
 
     @staticmethod
-    def _rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x[..., 0::2], x[..., 1::2]
-        return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+        return torch.cat([-x2, x1], dim=-1)
+
+    def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        cos = cos.to(x.dtype)
+        sin = sin.to(x.dtype)
+        return x * cos + self._rotate_half(x) * sin
 
     def forward(
         self,
@@ -59,7 +63,7 @@ class RotaryEmbedding(nn.Module):
         offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         cos, sin = self._get_cos_sin(q.size(1), offset)
-        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
+        return self._apply_rope(q, cos, sin), self._apply_rope(k, cos, sin)
 
 
 class MultiHeadLatentAttention(nn.Module):
@@ -105,48 +109,40 @@ class MultiHeadLatentAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B, T, C = x.shape
         H, Dk, Dv, Dr = self.heads, self.k_head_dim, self.v_head_dim, self.rope_dim
-        Dqk = Dk + Dr
 
-        q_full = self.q_proj(x).view(B, T, H, Dqk)
+        q_full = self.q_proj(x).view(B, T, H, Dk + Dr)
+        q_nope, q_rope = q_full[..., :Dk], q_full[..., Dk:]
 
-        kv = self.kv_up_proj(self.kv_norm(self.kv_down_proj(x))).view(B, T, H, Dk + Dv)
-        k_nope, v_raw = kv[..., :Dk], kv[..., Dk:]
+        kv_latent = self.kv_norm(self.kv_down_proj(x))
+        kv = self.kv_up_proj(kv_latent).view(B, T, H, Dk + Dv)
+        k_nope, v = kv[..., :Dk], kv[..., Dk:]
+
         k_rope_shared = self.k_rope_proj(x).view(B, T, 1, Dr)
 
-        q_buf = torch.empty_like(q_full)
-        q_buf[..., :Dk] = q_full[..., :Dk]
+        q_rope, k_rope_shared = self.rope(q_rope, k_rope_shared, offset)
 
-        k_buf = torch.empty(B, T, 1, Dqk, device=x.device, dtype=x.dtype)
-        k_buf[..., :Dk] = k_nope[:, :, :1, :]
+        k_rope = k_rope_shared.expand(B, T, H, Dr)
 
-        k_buf = torch.empty(B, T, H, Dqk, dtype=x.dtype, device=x.device)
-        k_buf[..., :Dk] = k_nope
-
-        q_rope_rot, k_rope_rot = self.rope(
-            q_full[..., Dk:],
-            k_rope_shared,
-            offset,
-        )
-
-        q_buf[..., Dk:] = q_rope_rot
-        k_buf[..., Dk:] = k_rope_rot
-
-        q_sdpa = q_buf.permute(0, 2, 1, 3)
-        k_sdpa = k_buf.permute(0, 2, 1, 3)
-        v_sdpa = v_raw.permute(0, 2, 1, 3)
+        q_sdpa = torch.cat([q_nope, q_rope], dim=-1).permute(0, 2, 1, 3)
+        k_sdpa = torch.cat([k_nope, k_rope], dim=-1).permute(0, 2, 1, 3)
+        v_sdpa = v.permute(0, 2, 1, 3)
 
         if kv_cache is not None and self.training is False:
-            k_prev, v_prev = kv_cache
-            k_sdpa = torch.cat([k_prev, k_sdpa], dim=2)
-            v_sdpa = torch.cat([v_prev, v_sdpa], dim=2)
-        new_kv_cache = (k_sdpa, v_sdpa)
+            latent_prev, k_rope_prev = kv_cache
+            kv_latent_cat = torch.cat([latent_prev, kv_latent], dim=1)
+            k_rope_cat = torch.cat([k_rope_prev, k_rope_shared], dim=1)
+            T_full = kv_latent_cat.shape[1]
+            kv_full = self.kv_up_proj(kv_latent_cat).view(B, T_full, H, Dk + Dv)
+            k_nope_full, v_sdpa = kv_full[..., :Dk], kv_full[..., Dk:].permute(0, 2, 1, 3)
+            k_rope_full = k_rope_cat.expand(B, T_full, H, Dr)
+            k_sdpa = torch.cat([k_nope_full, k_rope_full], dim=-1).permute(0, 2, 1, 3)
+
+            new_kv_cache = (kv_latent_cat, k_rope_cat)
+        else:
+            new_kv_cache = (kv_latent, k_rope_shared)
 
         is_causal = T > 1
-        is_fp16 = x.dtype == torch.float16
         dp = self.dropout_p if self.training else 0.0
-
-        if is_fp16:
-            q_sdpa, k_sdpa, v_sdpa = q_sdpa.float(), k_sdpa.float(), v_sdpa.float()
 
         out = F.scaled_dot_product_attention(
             q_sdpa,
@@ -158,9 +154,6 @@ class MultiHeadLatentAttention(nn.Module):
             scale=self.softmax_scale,
         )
 
-        del q_sdpa, k_sdpa, v_sdpa
-
-        out = out.to(x.dtype) if is_fp16 else out
         out = out.permute(0, 2, 1, 3).reshape(B, T, C)
         return self.out_proj(out), new_kv_cache
 
@@ -168,18 +161,18 @@ class MultiHeadLatentAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim: int, dropout: float = 0.1):
         super().__init__()
-        hidden = int(2 * dim * 4 / 3)
+        hidden = int(8 * dim / 3)
         hidden = (hidden + 63) // 64 * 64
+        self.hidden = hidden
 
-        self.w1 = nn.Linear(dim, hidden, bias=False)
-        self.w2 = nn.Linear(dim, hidden, bias=False)
-        self.w3 = nn.Linear(hidden, dim, bias=False)
+        self.w13 = nn.Linear(dim, 2 * hidden, bias=False)
+        self.w2 = nn.Linear(hidden, dim, bias=False)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        swiglu_output = SiLUMulFunction.apply(self.w1(x), self.w2(x))
-
-        return self.drop(self.w3(swiglu_output))
+        gate, up = self.w13(x).chunk(2, dim=-1)
+        swiglu_output = F.silu(gate) * up
+        return self.drop(self.w2(swiglu_output))
 
 
 class Block(nn.Module):
@@ -194,7 +187,7 @@ class Block(nn.Module):
         layer_idx: int = -1,
     ):
         super().__init__()
-        self.ln1 = nn.RMSNorm(dim)
+        self.ln1 = RMSNorm(dim)
         self.attn = MultiHeadLatentAttention(
             dim,
             heads,
@@ -204,7 +197,7 @@ class Block(nn.Module):
             rope_dim=rope_dim,
             layer_idx=layer_idx,
         )
-        self.ln2 = nn.RMSNorm(dim)
+        self.ln2 = RMSNorm(dim)
         self.ff = FeedForward(dim, dropout)
 
     def forward(

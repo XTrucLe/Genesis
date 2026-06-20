@@ -1,11 +1,11 @@
 import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from genesis.configs.cfg import CFG
 from genesis.core.model.modules import Block
-from genesis.core.ops.cross_entropy import liger_cross_entropy
 
 
 class Genesis(nn.Module):
@@ -58,15 +58,17 @@ class Genesis(nn.Module):
         B, T = x.shape
 
         h = self.drop(self.embedding(x))
-        new_kv_caches = [] if kv_caches is not None or y is None else None
+        use_cache = kv_caches is not None or (y is None and not self.training)
+        new_kv_caches = [] if use_cache else None
 
         for i, block in enumerate(self.blocks):
-            if self.training:
-                h = checkpoint(lambda x: block(x)[0], h, use_reentrant=False) if self.use_gc else block(h)[0]
+            if self.use_gc and self.training:
+                h = checkpoint(lambda inp, b=block: b(inp, offset=offset, kv_cache=None)[0], h, use_reentrant=False)
             else:
-                past_cache = kv_caches[i] if kv_caches is not None else None
+                past_cache = kv_caches[i] if (kv_caches is not None) else None
                 h, new_cache = block(h, offset=offset, kv_cache=past_cache)
-                if new_kv_caches is not None:
+
+                if use_cache:
                     new_kv_caches.append(new_cache)
 
         logits = self.lm_head(self.ln_f(h))
@@ -75,7 +77,7 @@ class Genesis(nn.Module):
             return logits, new_kv_caches
 
         assert y.shape == (B, T)
-        loss = liger_cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
         return logits, loss
 
     def num_params(self) -> str:

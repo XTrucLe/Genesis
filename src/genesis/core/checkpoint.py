@@ -71,8 +71,6 @@ class CheckpointModule:
             training_state_path,
         )
 
-        print(f"\n📡 [HF Backup] Spawning background worker to upload step {step}...")
-
         try:
             self.api.upload_folder(
                 folder_path=self.local_temp_dir,

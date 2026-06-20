@@ -13,18 +13,41 @@ task_queue = queue.Queue()
 
 def _gpu_info():
     if not torch.cuda.is_available():
-        return False, False, False
+        return {"arch": None, "bf16": False}
 
     major, minor = torch.cuda.get_device_capability(0)
+    sm = major * 10 + minor
+    bf16 = torch.cuda.is_bf16_supported()
 
-    is_ampere = major >= 8
-    is_turing = major == 7
-    has_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    if major == 7:
+        arch = "turing/volta"
+    elif major == 8:
+        arch = "ampere"
+    elif major == 9:
+        arch = "hopper"
+    elif major >= 12:
+        arch = "blackwell"
+    else:
+        arch = "unknown"
 
-    return is_ampere, is_turing, has_bf16
+    return {"arch": arch, "bf16": bf16, "sm": sm}
 
 
-IS_AMPERE, IS_TURING, HAS_BF16 = _gpu_info()
+def _best_sdpa_backend(sm: int):
+    from torch.nn.attention import SDPBackend
+
+    if sm >= 90:
+        if torch.backends.cuda.cudnn_sdp_enabled():
+            return SDPBackend.CUDNN_ATTENTION
+    if torch.backends.cuda.flash_sdp_enabled():
+        return SDPBackend.FLASH_ATTENTION
+    if torch.backends.cuda.mem_efficient_sdp_enabled():
+        return SDPBackend.EFFICIENT_ATTENTION
+    return SDPBackend.MATH
+
+
+ARCH, BF16, SM = _gpu_info().values()
+SDPA_BACKEND = _best_sdpa_backend(SM)
 
 
 def get_lr(step, cfg):

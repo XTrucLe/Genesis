@@ -4,7 +4,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import bitsandbytes as bnb
 from genesis.core.model.Genesis import Genesis
-from genesis.utils.common import IS_AMPERE, get_lr, task_queue
+from genesis.utils.common import SDPA_BACKEND, SM, get_lr, task_queue
 
 
 class Trainer:
@@ -45,10 +45,13 @@ class Trainer:
 
     def _setup_device_env(self):
         ddp = int(os.environ.get("RANK", -1)) != -1
+        local_rank = None
+
         if ddp:
             dist.init_process_group(backend="nccl")
             local_rank = int(os.environ["LOCAL_RANK"])
             device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
             master_process = int(os.environ["RANK"]) == 0
             world_size = int(os.environ["WORLD_SIZE"])
         else:
@@ -56,28 +59,40 @@ class Trainer:
             master_process = True
             world_size = 1
 
-        if device.type == "cuda":
-            torch.cuda.manual_seed(self.cfg["seed"])
-            if IS_AMPERE:
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
-
         torch.manual_seed(self.cfg["seed"])
-        return device, master_process, world_size, local_rank if ddp else None
+
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(self.cfg["seed"])
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.preferred_blas_library("cublaslt")
+
+            if SM >= 90:
+                torch.backends.cuda.enable_flash_sdp(False)
+                torch.backends.cuda.enable_cudnn_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+            else:
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_cudnn_sdp(False)
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+
+        return device, master_process, world_size, local_rank
 
     def run(self):
         device, master_process, ddp_world_size, ddp_local_rank = self._setup_device_env()
         ddp = ddp_world_size > 1
         is_cuda = device.type == "cuda"
 
-        model = self._build_model().to(device)
-        optimizer = self._build_optimizer(model)
-
-        amp_dtype = torch.float16 if self.cfg["dtype"] == "float16" else torch.bfloat16
+        amp_dtype = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(self.cfg["dtype"], torch.float32)
 
         scaler = torch.amp.GradScaler(enabled=(is_cuda and self.cfg["dtype"] == "float16"))
-        amp_ctx = torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=is_cuda)
+
+        model = self._build_model().to(device, dtype=amp_dtype)
+        optimizer = self._build_optimizer(model)
 
         loader = self.data_manager.build_loader()
         start_step = step = (
@@ -96,7 +111,7 @@ class Trainer:
 
         if self.cfg["compile"] and hasattr(torch, "compile"):
             if master_process:
-                print("Compiling model via Inductor (max-autotune)...")
+                print("Compiling model via Inductor...")
             torch._inductor.config.triton.cudagraphs = False
             torch._inductor.config.coordinate_descent_tuning = True
             model = torch.compile(model)
@@ -117,7 +132,7 @@ class Trainer:
         loss_tensor = torch.zeros(1, device=device) if ddp else None
 
         if master_process:
-            print("─" * 56)
+            print("─" * 80)
             print("🚀 MODEL CONFIG :")
             print(f"   • Architecture: Dim = {self.cfg['dim']} | Layers = {self.cfg['layers']} | Heads = {self.cfg['heads']}")
             print(f"   • Context Len : {self.cfg['block_size']} tokens")
@@ -125,12 +140,12 @@ class Trainer:
             print(f"   • Gradient Checkpt: {'Enabled' if self.cfg['grad_checkpoint'] else 'Disabled'}")
             print("\n⚙️ TRAINING CONFIG:")
             print(f"   • Device/GPU  : {torch.cuda.get_device_name(device) if is_cuda else 'CPU'}")
-            print(f"   • Precision   : {self.cfg['dtype'].upper()} (Scaler: {'ON' if scaler.is_enabled() else 'OFF'})")
+            print(f"   • Precision   : {self.cfg['dtype'].upper()} {'(Gradient Scaler Enabled)' if scaler.is_enabled() else ''}")
             print(f"   • Total Batch : {tokens_per_step:,} tokens/step (Accum: {self.cfg['grad_accum']})")
             print(f"   • DDP Mode    : {'Active' if ddp else 'Disabled'} ({ddp_world_size} GPU{'' if ddp_world_size == 1 else 's'})")
             steps_info = f"{step:,} → {start_step + self.cfg['short_run_steps']:,} [SHORT RUN]" if self.cfg["short_run"] else f"{step:,} → {self.cfg['total_steps']:,}"
             print(f"   • Total Steps : {steps_info}")
-            print("─" * 56 + "\n")
+            print("─" * 80 + "\n")
 
         while step < self.cfg["total_steps"]:
             lr = get_lr(step, self.cfg)
@@ -146,49 +161,49 @@ class Trainer:
             if is_cuda and do_log and master_process:
                 t0.record()
 
-            for _ in range(self.cfg["grad_accum"]):
-                if ddp:
-                    model.require_backward_grad_sync = _ == self.cfg["grad_accum"] - 1
+            with torch.nn.attention.sdpa_kernel(SDPA_BACKEND):
+                for _ in range(self.cfg["grad_accum"]):
+                    if ddp:
+                        model.require_backward_grad_sync = _ == self.cfg["grad_accum"] - 1
 
-                try:
-                    x, y = next(data_iter)
-                except StopIteration:
-                    data_iter = iter(loader)
-                    x, y = next(data_iter)
+                    try:
+                        x, y = next(data_iter)
+                    except StopIteration:
+                        data_iter = iter(loader)
+                        x, y = next(data_iter)
 
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-                with amp_ctx:
                     _, loss = model(x, y)
 
-                scaled_loss = loss / self.cfg["grad_accum"]
-                (scaler.scale(scaled_loss).backward() if scaler.is_enabled() else scaled_loss.backward())
-                accum_loss_tensor += scaled_loss.detach()
+                    scaled_loss = loss / self.cfg["grad_accum"]
+                    (scaler.scale(scaled_loss).backward() if scaler.is_enabled() else scaled_loss.backward())
+                    accum_loss_tensor += scaled_loss.detach()
 
-            if ddp:
-                loss_tensor.fill_(accum_loss_tensor)
-                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-                accum_loss_val = loss_tensor.item()
-            else:
-                accum_loss_val = accum_loss_tensor.item()
+                if ddp:
+                    loss_tensor.fill_(accum_loss_tensor)
+                    dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                    accum_loss_val = loss_tensor.item()
+                else:
+                    accum_loss_val = accum_loss_tensor.item()
 
-            if scaler.is_enabled():
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg["max_grad_norm"])
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg["max_grad_norm"])
-                optimizer.step()
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg["max_grad_norm"])
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg["max_grad_norm"])
+                    optimizer.step()
 
             if do_log and master_process:
                 if is_cuda:
                     t1.record()
                     torch.cuda.synchronize()
                     ms = t0.elapsed_time(t1)
-                    msg = f"step {step:7d} | loss {accum_loss_val:.5f} | lr {lr:.2e} | {tokens_per_step / ms:.1f}k tok/s | {ms:.0f}ms"
+                    msg = f"step {step:7d} | loss {accum_loss_val:8.5f} | lr {lr:9.2e} | {tokens_per_step / ms:8.2f}k tok/s | {ms:7.0f}ms"
                 else:
-                    msg = f"step {step:7d} | loss {accum_loss_val:.5f} | lr {lr:.2e}"
+                    msg = f"step {step:7d} | loss {accum_loss_val:8.5f} | lr {lr:9.2e}"
                 task_queue.put({"type": "log", "data": msg})
 
             if self.cfg["short_run"] and step >= start_step + self.cfg["short_run_steps"]:
